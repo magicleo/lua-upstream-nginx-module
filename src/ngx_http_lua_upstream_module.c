@@ -14,6 +14,7 @@
 #include <ngx_http.h>
 #include <lauxlib.h>
 #include "ngx_http_lua_api.h"
+#include "ngx_http_dyups_module.h"
 
 
 ngx_module_t ngx_http_lua_upstream_module;
@@ -35,7 +36,13 @@ static ngx_http_upstream_rr_peer_t *
     ngx_http_lua_upstream_lookup_peer(lua_State *L);
 static int ngx_http_lua_upstream_set_peer_down(lua_State * L);
 
+static int ngx_http_lua_upstream_add_upstream(lua_State * L);
 
+/*extern void ngx_http_dyups_read_msg_locked(ngx_event_t *ev);
+extern ngx_int_t ngx_dyups_sandbox_update(ngx_buf_t *buf, ngx_str_t *rv);
+extern ngx_int_t ngx_dyups_do_update(ngx_str_t *name, ngx_buf_t *buf,
+    ngx_str_t *rv);
+*/
 static ngx_http_module_t ngx_http_lua_upstream_ctx = {
     NULL,                           /* preconfiguration */
     ngx_http_lua_upstream_init,     /* postconfiguration */
@@ -63,6 +70,7 @@ ngx_module_t ngx_http_lua_upstream_module = {
     NGX_MODULE_V1_PADDING
 };
 
+extern ngx_dyups_global_ctx_t ngx_dyups_global_ctx;
 
 static ngx_int_t
 ngx_http_lua_upstream_init(ngx_conf_t *cf)
@@ -98,7 +106,94 @@ ngx_http_lua_upstream_create_module(lua_State * L)
     lua_pushcfunction(L, ngx_http_lua_upstream_set_peer_down);
     lua_setfield(L, -2, "set_peer_down");
 
+    lua_pushcfunction(L, ngx_http_lua_upstream_add_upstream);
+    lua_setfield(L, -2, "add_upstream");
+
     return 1;
+}
+
+
+static int
+ngx_http_lua_upstream_add_upstream(lua_State * L)
+{
+    if (lua_gettop(L) != 2) {
+        return luaL_error(L, "two arguments expected: upstream_name, upstream_conf");
+    }
+
+    ngx_str_t                    rv;
+    ngx_buf_t                   *body;
+	ngx_str_t					 name;
+	ngx_str_t					 str_body;
+    ngx_http_request_t          *r;
+
+	ngx_event_t                 *timer;
+    ngx_slab_pool_t             *shpool;
+	ngx_int_t	rc;
+	ngx_str_t uri;
+
+	name.data = (u_char *) luaL_checklstring(L, 1, &name.len);
+	str_body.data =  (u_char *) luaL_checklstring(L, 2, &str_body.len);
+
+    r = ngx_http_lua_get_request(L);
+
+    if (r == NULL) {
+		return luaL_error(L, "get req error");	
+    }
+	
+	body = ngx_create_temp_buf(r->pool, str_body.len);
+	
+    if (body == NULL) {
+	    return luaL_error(L, "get body pool error");	
+    }
+
+	body->last = ngx_cpymem(body->last, str_body.data, str_body.len);
+
+	timer = &ngx_dyups_global_ctx.msg_timer;
+    shpool = ngx_dyups_global_ctx.shpool;
+
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                   "[dyups] add upstream name: %V ,value %V", &name, &str_body);
+
+
+	
+	ngx_shmtx_lock(&shpool->mutex);
+	
+    ngx_http_dyups_read_msg_locked(timer);
+	
+    rc = ngx_dyups_sandbox_update(body, &rv);
+    if (rc != NGX_HTTP_OK) {
+        return luaL_error(L, "sandbox update error");;
+    }
+
+    rc = ngx_dyups_do_update(&name, body, &rv);
+
+    if (rc != NGX_HTTP_OK) {
+        return luaL_error(L, "dyups update error");
+    }
+
+	uri.len = name.len + sizeof("/upstream/") - 1;
+
+	uri.data = (u_char *) ngx_pcalloc(r->pool, uri.len);
+
+    if (uri.data == NULL) {
+ 	    return luaL_error(L, "pcalloc for uri error");
+    }
+
+	ngx_snprintf(uri.data, uri.len ,"/upstream/%V",&name);
+	
+	ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+					  "[dyups] try send msg %V ", &uri);
+		
+    if (ngx_http_dyups_send_msg(&uri, body, NGX_DYUPS_ADD) != NGX_OK) {
+		ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+					  "[dyups] send msg %V error ", &uri);
+    }
+
+    ngx_shmtx_unlock(&shpool->mutex);
+    lua_pushboolean (L, 1);
+    lua_pushliteral(L, "sucess");
+    return 2;
 }
 
 
